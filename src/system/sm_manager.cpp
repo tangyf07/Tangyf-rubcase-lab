@@ -21,8 +21,6 @@ See the Mulan PSL v2 for more details. */
 
 /**
  * @description: 判断是否为一个文件夹
- * @return {bool} 返回是否为一个文件夹
- * @param {string&} db_name 数据库文件名称，与文件夹同名
  */
 bool SmManager::is_dir(const std::string& db_name) {
     struct stat st;
@@ -30,45 +28,36 @@ bool SmManager::is_dir(const std::string& db_name) {
 }
 
 /**
- * @description: 创建数据库，所有的数据库相关文件都放在数据库同名文件夹下
- * @param {string&} db_name 数据库名称
+ * @description: 创建数据库
  */
 void SmManager::create_db(const std::string& db_name) {
     if (is_dir(db_name)) {
         throw DatabaseExistsError(db_name);
     }
-    //为数据库创建一个子目录
     std::string cmd = "mkdir " + db_name;
-    if (system(cmd.c_str()) < 0) {  // 创建一个名为db_name的目录
+    if (system(cmd.c_str()) < 0) {
         throw UnixError();
     }
-    if (chdir(db_name.c_str()) < 0) {  // 进入名为db_name的目录
+    if (chdir(db_name.c_str()) < 0) {
         throw UnixError();
     }
-    //创建系统目录
     DbMeta *new_db = new DbMeta();
     new_db->name_ = db_name;
 
-    // 注意，此处ofstream会在当前目录创建(如果没有此文件先创建)和打开一个名为DB_META_NAME的文件
     std::ofstream ofs(DB_META_NAME);
-
-    // 将new_db中的信息，按照定义好的operator<<操作符，写入到ofs打开的DB_META_NAME文件中
-    ofs << *new_db;  // 注意：此处重载了操作符<<
+    ofs << *new_db;
 
     delete new_db;
 
-    // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
 
-    // 回到根目录
     if (chdir("..") < 0) {
         throw UnixError();
     }
 }
 
 /**
- * @description: 删除数据库，同时需要清空相关文件以及数据库同名文件夹
- * @param {string&} db_name 数据库名称，与文件夹同名
+ * @description: 删除数据库
  */
 void SmManager::drop_db(const std::string& db_name) {
     if (!is_dir(db_name)) {
@@ -81,18 +70,34 @@ void SmManager::drop_db(const std::string& db_name) {
 }
 
 /**
- * @description: 打开数据库，找到数据库对应的文件夹，并加载数据库元数据和相关文件
- * @param {string&} db_name 数据库名称，与文件夹同名
+ * @description: 打开数据库
  */
 void SmManager::open_db(const std::string& db_name) {
-    
+    if (!is_dir(db_name)) {
+        throw DatabaseNotFoundError(db_name);
+    }
+    if (chdir(db_name.c_str()) < 0) {
+        throw UnixError();
+    }
+
+    std::ifstream ifs(DB_META_NAME);
+    if (!ifs.is_open()) {
+        throw UnixError();
+    }
+    ifs >> db_;
+
+    fhs_.clear();
+    ihs_.clear();
+    for (auto &entry : db_.tabs_) {
+        const std::string &tab_name = entry.first;
+        fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+    }
 }
 
 /**
  * @description: 把数据库相关的元数据刷入磁盘中
  */
 void SmManager::flush_meta() {
-    // 默认清空文件
     std::ofstream ofs(DB_META_NAME);
     ofs << db_;
 }
@@ -101,12 +106,22 @@ void SmManager::flush_meta() {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    
+    flush_meta();
+
+    for (auto itf = fhs_.begin(); itf != fhs_.end(); ++itf) {
+        rm_manager_->close_file(itf->second.get());
+    }
+
+    fhs_.clear();
+    ihs_.clear();
+
+    if (chdir("..") < 0) {
+        throw UnixError();
+    }
 }
 
 /**
- * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
- * @param {Context*} context 
+ * @description: 显示所有的表
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
@@ -127,96 +142,215 @@ void SmManager::show_tables(Context* context) {
 
 /**
  * @description: 显示表的元数据
- * @param {string&} tab_name 表名称
- * @param {Context*} context 
  */
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
 
     std::vector<std::string> captions = {"Field", "Type", "Index"};
     RecordPrinter printer(captions.size());
-    // Print header
     printer.print_separator(context);
     printer.print_record(captions, context);
     printer.print_separator(context);
-    // Print fields
     for (auto &col : tab.cols) {
         std::vector<std::string> field_info = {col.name, coltype2str(col.type), col.index ? "YES" : "NO"};
         printer.print_record(field_info, context);
     }
-    // Print footer
     printer.print_separator(context);
 }
 
 /**
  * @description: 创建表
- * @param {string&} tab_name 表的名称
- * @param {vector<ColDef>&} col_defs 表的字段
- * @param {Context*} context 
  */
-void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
+void SmManager::create_table(const std::string& tab_name,
+                             const std::vector<ColDef>& col_defs,
+                             Context* context) {
+
     if (db_.is_table(tab_name)) {
         throw TableExistsError(tab_name);
     }
-    // Create table meta
+
     int curr_offset = 0;
     TabMeta tab;
     tab.name = tab_name;
+
     for (auto &col_def : col_defs) {
-        ColMeta col = {.tab_name = tab_name,
-                       .name = col_def.name,
-                       .type = col_def.type,
-                       .len = col_def.len,
-                       .offset = curr_offset,
-                       .index = false};
+        ColMeta col = {
+            .tab_name = tab_name,
+            .name = col_def.name,
+            .type = col_def.type,
+            .len = col_def.len,
+            .offset = curr_offset,
+            .index = false
+        };
         curr_offset += col_def.len;
         tab.cols.push_back(col);
     }
-    // Create & open record file
-    int record_size = curr_offset;  // record_size就是col meta所占的大小（表的元数据也是以记录的形式进行存储的）
+
+    int record_size = curr_offset;
+
     rm_manager_->create_file(tab_name, record_size);
     db_.tabs_[tab_name] = tab;
-    // fhs_[tab_name] = rm_manager_->open_file(tab_name);
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+
+    // ===== 任务3: 添加 X 锁 =====
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        int fd = fhs_.at(tab_name)->GetFd();
+        if (!context->lock_mgr_->lock_exclusive_on_table(context->txn_, fd)) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+    // ============================
 
     flush_meta();
 }
 
 /**
  * @description: 删除表
- * @param {string&} tab_name 表的名称
- * @param {Context*} context
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
-    
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+
+    // ===== 任务3: 添加 X 锁 =====
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        auto itf = fhs_.find(tab_name);
+        if (itf != fhs_.end()) {
+            int fd = itf->second->GetFd();
+            if (!context->lock_mgr_->lock_exclusive_on_table(context->txn_, fd)) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+    }
+    // ============================
+
+    auto itf = fhs_.find(tab_name);
+    if (itf != fhs_.end()) {
+        rm_manager_->close_file(itf->second.get());
+        fhs_.erase(itf);
+    }
+
+    rm_manager_->destroy_file(tab_name);
+    db_.tabs_.erase(tab_name);
+    flush_meta();
 }
 
 /**
  * @description: 创建索引
- * @param {string&} tab_name 表的名称
- * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+
+    // ===== 任务3: 添加 S 锁 =====
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        auto itf = fhs_.find(tab_name);
+        if (itf != fhs_.end()) {
+            int fd = itf->second->GetFd();
+            if (!context->lock_mgr_->lock_shared_on_table(context->txn_, fd)) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+    }
+    // ============================
     
+    TabMeta& tab = db_.get_table(tab_name);
+    
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    
+    std::vector<ColMeta> index_cols;
+    int col_tot_len = 0;
+    for (const auto& col_name : col_names) {
+        auto col_it = tab.get_col(col_name);
+        index_cols.push_back(*col_it);
+        col_tot_len += col_it->len;
+    }
+    
+    ix_manager_->create_index(tab_name, index_cols);
+    auto ih = ix_manager_->open_index(tab_name, index_cols);
+    
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_tot_len = col_tot_len;
+    index_meta.col_num = col_names.size();
+    index_meta.cols = index_cols;
+    tab.indexes.push_back(index_meta);
+    
+    std::string index_name = ix_manager_->get_index_name(tab_name, col_names);
+    ihs_[index_name] = std::move(ih);
+    
+    flush_meta();
 }
 
 /**
  * @description: 删除索引
- * @param {string&} tab_name 表名称
- * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+
+    // ===== 任务3: 添加 S 锁 =====
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        auto itf = fhs_.find(tab_name);
+        if (itf != fhs_.end()) {
+            int fd = itf->second->GetFd();
+            if (!context->lock_mgr_->lock_shared_on_table(context->txn_, fd)) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+    }
+    // ============================
+
+    TabMeta& tab = db_.get_table(tab_name);
+
+    if (!tab.is_index(col_names)) {
+        throw IndexNotFoundError(tab_name, col_names);
+    }
+
+    std::string index_name = ix_manager_->get_index_name(tab_name, col_names);
+
+    auto it = ihs_.find(index_name);
+    if (it != ihs_.end()) {
+        ix_manager_->close_index(it->second.get());
+        ihs_.erase(it);
+    }
+
+    std::vector<ColMeta> index_cols;
+    for (const auto& col_name : col_names) {
+        auto col_it = tab.get_col(col_name);
+        index_cols.push_back(*col_it);
+    }
+    ix_manager_->destroy_index(tab_name, index_cols);
+
+    auto idx_it = tab.indexes.begin();
+    while (idx_it != tab.indexes.end()) {
+        std::vector<std::string> idx_col_names;
+        for (const auto& col : idx_it->cols) {
+            idx_col_names.push_back(col.name);
+        }
+        if (idx_col_names == col_names) {
+            idx_it = tab.indexes.erase(idx_it);
+            break;
+        } else {
+            ++idx_it;
+        }
+    }
+
+    flush_meta();
 }
 
 /**
- * @description: 删除索引
- * @param {string&} tab_name 表名称
- * @param {vector<ColMeta>&} 索引包含的字段元数据
- * @param {Context*} context
+ * @description: 删除索引（重载版本）
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
-    
+    std::vector<std::string> col_names;
+    for (const auto& col : cols) {
+        col_names.push_back(col.name);
+    }
+    drop_index(tab_name, col_names, context);
 }

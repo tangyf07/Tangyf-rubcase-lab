@@ -47,32 +47,58 @@ class SeqScanExecutor : public AbstractExecutor {
 
     /**
      * @brief 构建表迭代器scan_,并开始迭代扫描,直到扫描到第一个满足谓词条件的元组停止,并赋值给rid_
-     *
      */
     void beginTuple() override {
-        
+        // ===== 任务3: 添加表 S 锁 =====
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            int fd = fh_->GetFd();
+            if (!context_->lock_mgr_->lock_shared_on_table(context_->txn_, fd)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+        // ==============================
+
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            if (eval_conds(rec.get(), fed_conds_, cols_)) {
+                return;
+            }
+            scan_->next();
+        }
+        rid_ = Rid{-1, -1};
     }
 
     /**
      * @brief 从当前scan_指向的记录开始迭代扫描,直到扫描到第一个满足谓词条件的元组停止,并赋值给rid_
-     *
      */
     void nextTuple() override {
-        
+        scan_->next();
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            if (eval_conds(rec.get(), fed_conds_, cols_)) {
+                return;
+            }
+            scan_->next();
+        }
+        rid_ = Rid{-1, -1};
     }
 
     /**
      * @brief 返回下一个满足扫描条件的记录
-     *
-     * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) return nullptr;
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }
 
-    bool is_end() const override { return true; }
+    bool is_end() const override {
+        return rid_.page_no == -1;
+    }
     
     std::string getType() override { return "SeqScanExecutor"; }
 
@@ -80,9 +106,42 @@ class SeqScanExecutor : public AbstractExecutor {
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
-    private:
-    bool eval_cond(const RmRecord *rec, const Condition &cond, const std::vector<ColMeta> &rec_cols) {
-        return true;
+private:
+    bool eval_cond(const RmRecord *rec, const Condition &cond,
+                   const std::vector<ColMeta> &rec_cols) {
+        char *lhs_val = nullptr;
+        char *rhs_val = nullptr;
+        ColType lhs_type, rhs_type;
+        int lhs_len = 0, rhs_len = 0;
+
+        auto lhs_it = get_col(rec_cols, cond.lhs_col);
+        lhs_type = lhs_it->type;
+        lhs_len  = lhs_it->len;
+        lhs_val  = const_cast<char *>(rec->data + lhs_it->offset);
+
+        if (cond.is_rhs_val) {
+            rhs_type = cond.rhs_val.type;
+            rhs_len  = cond.rhs_val.raw->size;
+            rhs_val  = const_cast<char *>(cond.rhs_val.raw->data);
+        } else {
+            auto rhs_it = get_col(rec_cols, cond.rhs_col);
+            rhs_type = rhs_it->type;
+            rhs_len  = rhs_it->len;
+            rhs_val  = const_cast<char *>(rec->data + rhs_it->offset);
+        }
+
+        if (lhs_type != rhs_type) return false;
+
+        int cmp = ix_compare(lhs_val, rhs_val, lhs_type, lhs_len);
+        switch (cond.op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp <  0;
+            case OP_GT: return cmp >  0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+            default:    return false;
+        }
     }
 
     bool eval_conds(const RmRecord *rec, const std::vector<Condition> &conds, const std::vector<ColMeta> &rec_cols) {

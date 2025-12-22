@@ -68,7 +68,7 @@ class RmManager {
      */
     std::unique_ptr<RmFileHandle> open_file(const std::string& filename) {
         int fd = disk_manager_->open_file(filename);
-        return std::make_unique<RmFileHandle>(disk_manager_, buffer_pool_manager_, fd);
+        return std::make_unique<RmFileHandle>(disk_manager_, buffer_pool_manager_, fd, filename);
     }
     /**
      * @description: 关闭表的数据文件

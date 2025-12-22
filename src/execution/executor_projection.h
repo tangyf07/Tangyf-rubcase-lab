@@ -39,17 +39,39 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
+    void beginTuple() override {
+    prev_->beginTuple();  // 让子节点定位到第一条
+}
 
-    void nextTuple() override {}
+    void nextTuple() override {
+    prev_->nextTuple();  // 让子节点向后移动一条
+}
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+    if (is_end()) return nullptr;
+
+    // 1. 从子节点拿整条原始记录
+    auto raw_rec = prev_->Next();
+    if (!raw_rec) return nullptr;
+
+    // 2. 创建投影后的记录缓冲区
+    auto proj_rec = std::make_unique<RmRecord>(len_);
+    char *dst = proj_rec->data;
+
+    // 3. 按 sel_idxs_ 把需要的列拷贝到新区
+    for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+        const ColMeta &col = cols_[i];
+        const char *src = raw_rec->data + prev_->cols()[sel_idxs_[i]].offset;
+        std::memcpy(dst + col.offset, src, col.len);
     }
+    return proj_rec;
+}
 
     Rid &rid() override { return _abstract_rid; }
 
-    bool is_end() const override { return true; }
+    bool is_end() const override {
+    return prev_->is_end();  // 子节点没数据了，投影也就结束了
+}
     
     std::string getType() override { return "ProjectionExecutor"; }
 

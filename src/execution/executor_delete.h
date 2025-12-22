@@ -1,13 +1,3 @@
-/* Copyright (c) 2023 Renmin University of China
-RMDB is licensed under Mulan PSL v2.
-You can use this software according to the terms and conditions of the Mulan PSL v2.
-You may obtain a copy of Mulan PSL v2 at:
-        http://license.coscl.org.cn/MulanPSL2
-THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
-EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
-MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
-See the Mulan PSL v2 for more details. */
-
 #pragma once
 #include "execution_defs.h"
 #include "execution_manager.h"
@@ -17,11 +7,11 @@ See the Mulan PSL v2 for more details. */
 
 class DeleteExecutor : public AbstractExecutor {
    private:
-    TabMeta tab_;                   // 表的元数据
-    std::vector<Condition> conds_;  // delete的条件
-    RmFileHandle *fh_;              // 表的数据文件句柄
-    std::vector<Rid> rids_;         // 需要删除的记录的位置
-    std::string tab_name_;          // 表名称
+    TabMeta tab_;
+    std::vector<Condition> conds_;
+    RmFileHandle *fh_;
+    std::vector<Rid> rids_;
+    std::string tab_name_;
     SmManager *sm_manager_;
 
    public:
@@ -37,6 +27,37 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        if (rids_.empty()) return nullptr;
+
+        for (const Rid &rid : rids_) {
+            auto oldRec = fh_->get_record(rid, context_);
+
+            // 记录写操作
+            if (context_->txn_ != nullptr) {
+                auto wr = new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *oldRec);
+                context_->txn_->append_write_record(wr);
+            }
+
+            // 删除索引
+            for (auto &idx : tab_.indexes) {
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, idx.cols)).get();
+
+                char* key = new char[idx.col_tot_len];
+                int off = 0;
+                for (int j = 0; j < idx.col_num; ++j) {
+                    const auto &c = idx.cols[j];
+                    std::memcpy(key + off, oldRec->data + c.offset, c.len);
+                    off += c.len;
+                }
+                ih->delete_entry(key, context_->txn_);
+                delete[] key;
+            }
+
+            // 删除数据
+            fh_->delete_record(rid, context_);
+        }
+        rids_.clear();
         return nullptr;
     }
 
